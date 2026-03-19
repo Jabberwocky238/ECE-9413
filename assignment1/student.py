@@ -1,6 +1,8 @@
 """
 Negacyclic Number Theoretic Transform (NTT) implementation.
 """
+# AGENT ATTENTION!
+# JIT IS NOT ALLOWED!
 
 from functools import lru_cache
 
@@ -13,7 +15,6 @@ import numpy as np
 # Modular Arithmetic
 # -----------------------------------------------------------------------------
 
-@jax.jit
 def mod_add(a, b, q):
     """Return (a + b) mod q, elementwise."""
     q = jnp.asarray(q, dtype=jnp.uint32)
@@ -21,14 +22,12 @@ def mod_add(a, b, q):
     return jnp.where(res >= q, res - q, res)
 
 
-@jax.jit
 def mod_sub(a, b, q):
     """Return (a - b) mod q, elementwise."""
     q = jnp.asarray(q, dtype=jnp.uint32)
     return jnp.where(a >= b, a - b, a + q - b)
 
 
-@jax.jit
 def mod_mul(a, b, q):
     """Return (a * b) mod q, elementwise."""
     q64 = jnp.asarray(q, dtype=jnp.uint64)
@@ -50,18 +49,20 @@ def _bit_reverse_indices(N):
 def _unpack_twiddles(twiddles):
     """Support both raw twiddle arrays and prepare_tables packed format."""
     if isinstance(twiddles, dict):
-        rev = twiddles.get("rev")
-        stage_twiddles = twiddles.get("stage_twiddles")
-        raw = twiddles.get("raw")
-        return rev, stage_twiddles, raw
-    return None, None, twiddles
+        return (
+            twiddles.get("rev"),
+            twiddles.get("psi_rev"),
+            twiddles.get("stage_twiddles"),
+            twiddles.get("raw"),
+        )
+    return None, None, None, twiddles
 
 
 # -----------------------------------------------------------------------------
 # Core NTT
 # -----------------------------------------------------------------------------
 
-@jax.jit
+# @jax.jit
 def ntt(x, *, q, psi_powers, twiddles):
     """
     Compute the forward negacyclic NTT.
@@ -70,7 +71,7 @@ def ntt(x, *, q, psi_powers, twiddles):
         x: Input coefficients, shape (batch, N), values in [0, q)
         q: Prime modulus satisfying (q - 1) % 2N == 0
         psi_powers: Precomputed psi^n table
-        twiddles: Precomputed twiddle table
+        twiddles: Precomputed twiddle table or packed prepare_tables format
 
     Returns:
         jnp.ndarray: NTT output, same shape as input
@@ -81,34 +82,40 @@ def ntt(x, *, q, psi_powers, twiddles):
     batch, N = x.shape
     logN = N.bit_length() - 1
 
-    rev, stage_twiddles, raw_twiddles = _unpack_twiddles(twiddles)
-    if rev is None:
-        rev = _bit_reverse_indices(N)
+    rev, psi_rev, stage_twiddles, raw_twiddles = _unpack_twiddles(twiddles)
 
-    # Step 1: Apply negacyclic twist.
-    y = mod_mul(x, psi_powers, q)
+    # Fast path:
+    # fuse the negacyclic twist with the bit-reversal gather
+    # so we avoid:
+    #   y = mod_mul(x, psi_powers, q)
+    #   y = y[:, rev]
+    if rev is not None and psi_rev is not None:
+        y = mod_mul(x[:, rev], psi_rev, q)
+    else:
+        if rev is None:
+            rev = _bit_reverse_indices(N)
+        y = mod_mul(x, psi_powers, q)
+        y = y[:, rev]
 
-    # Step 2: Bit-reversal permutation.
-    y = y[:, rev]
-
-    # Step 3: Cooley-Tukey butterfly stages.
+    # Butterfly stages
     for stage in range(logN):
         span = 1 << stage
         block = 2 * span
         num_blocks = N // block
+
         if stage_twiddles is None:
-            tw = raw_twiddles[span:block]
+            tw = jnp.asarray(raw_twiddles[span:block], dtype=jnp.uint32).reshape(1, 1, span)
         else:
             tw = stage_twiddles[stage]
 
         y_reshaped = y.reshape(batch, num_blocks, 2, span)
         u = y_reshaped[:, :, 0, :]
         v = y_reshaped[:, :, 1, :]
-        tw = tw.reshape(1, 1, span)
 
         t = mod_mul(v, tw, q)
         top = mod_add(u, t, q)
         bot = mod_sub(u, t, q)
+
         y = jnp.stack((top, bot), axis=2).reshape(batch, N)
 
     return y
@@ -126,12 +133,20 @@ def prepare_tables(*, q, psi_powers, twiddles):
         raise ValueError(f"N must be a positive power of two, got {N}")
 
     logN = N.bit_length() - 1
+    rev = _bit_reverse_indices(N)
+
+    # Precompute:
+    # 1) psi_powers in bit-reversed order, so twist+permute can be fused
+    # 2) stage twiddles already reshaped for broadcast
+    psi_rev = psi_powers[rev]
     stage_twiddles = tuple(
-        twiddles[1 << s: 1 << (s + 1)] for s in range(logN)
+        twiddles[1 << s: 1 << (s + 1)].reshape(1, 1, 1 << s)
+        for s in range(logN)
     )
+
     packed = {
-        "raw": twiddles,
-        "rev": _bit_reverse_indices(N),
+        "rev": rev,
+        "psi_rev": psi_rev,
         "stage_twiddles": stage_twiddles,
     }
     return psi_powers, packed
