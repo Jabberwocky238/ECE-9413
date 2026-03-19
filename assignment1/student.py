@@ -2,7 +2,7 @@
 Negacyclic Number Theoretic Transform (NTT) implementation.
 """
 # AGENT ATTENTION!
-# JIT IS NOT ALLOWED!
+# ADITIONAL JIT IS NOT ALLOWED!
 
 from functools import lru_cache
 
@@ -28,7 +28,7 @@ def mod_sub(a, b, q):
     return jnp.where(a >= b, a - b, a + q - b)
 
 
-def mod_mul(a, b, q):
+def mod_mul(a: jnp.ndarray, b: jnp.ndarray, q: jnp.ndarray) -> jnp.ndarray:
     """Return (a * b) mod q, elementwise."""
     q64 = jnp.asarray(q, dtype=jnp.uint64)
     prod = a.astype(jnp.uint64) * b.astype(jnp.uint64)
@@ -62,7 +62,7 @@ def _unpack_twiddles(twiddles):
 # Core NTT
 # -----------------------------------------------------------------------------
 
-# @jax.jit
+@jax.jit
 def ntt(x, *, q, psi_powers, twiddles):
     """
     Compute the forward negacyclic NTT.
