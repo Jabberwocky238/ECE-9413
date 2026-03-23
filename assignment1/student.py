@@ -152,10 +152,13 @@ def ntt(x, *, q, psi_powers, twiddles):
     Returns:
         jnp.ndarray: NTT output, same shape as input
     """
-    return ntt_candidate2(x, q=q, psi_powers=psi_powers, twiddles=twiddles)
+    return ntt_candidate1(x, q=q, psi_powers=psi_powers, twiddles=twiddles)
 
 def prepare_tables(*, q, psi_powers, twiddles):
     """Optional one-time table preparation."""
+    return prepare_tables0(q=q, psi_powers=psi_powers, twiddles=twiddles)
+
+def prepare_tables0(*, q, psi_powers, twiddles):
     del q
 
     psi_powers = jnp.asarray(psi_powers, dtype=jnp.uint32)
@@ -181,6 +184,51 @@ def prepare_tables(*, q, psi_powers, twiddles):
         "rev": rev,
         "psi_rev": psi_rev,
         "stage_twiddles": stage_twiddles,
+    }
+    return psi_powers, packed
+
+
+def prepare_tables2(*, q, psi_powers, twiddles):
+    """Prepare standard and Montgomery-domain tables for candidate2-style NTT."""
+    q32 = jnp.asarray(q, dtype=jnp.uint32)
+    psi_powers = jnp.asarray(psi_powers, dtype=jnp.uint32)
+    twiddles = jnp.asarray(twiddles, dtype=jnp.uint32)
+
+    N = int(psi_powers.shape[0])
+    if N <= 0 or (N & (N - 1)) != 0:
+        raise ValueError(f"N must be a positive power of two, got {N}")
+
+    logN = N.bit_length() - 1
+    rev = _bit_reverse_indices(N)
+
+    psi_rev = psi_powers[rev]
+    stage_twiddles = tuple(
+        twiddles[1 << s: 1 << (s + 1)].reshape(1, 1, 1 << s)
+        for s in range(logN)
+    )
+
+    q_neg_inv = montgomery_neg_inv32(int(q32))
+    r_mod_q = np.uint32((1 << 32) % int(q32))
+    psi_rev_mont = jnp.remainder(
+        psi_rev.astype(jnp.uint64) * jnp.asarray(r_mod_q, dtype=jnp.uint64),
+        q32.astype(jnp.uint64),
+    ).astype(jnp.uint32)
+    stage_twiddles_mont = tuple(
+        jnp.remainder(
+            tw.astype(jnp.uint64) * jnp.asarray(r_mod_q, dtype=jnp.uint64),
+            q32.astype(jnp.uint64),
+        ).astype(jnp.uint32)
+        for tw in stage_twiddles
+    )
+
+    packed = {
+        "rev": rev,
+        "psi_rev": psi_rev,
+        "psi_rev_mont": psi_rev_mont,
+        "stage_twiddles": stage_twiddles,
+        "stage_twiddles_mont": stage_twiddles_mont,
+        "q_neg_inv": jnp.asarray(q_neg_inv, dtype=jnp.uint32),
+        "r_mod_q": jnp.asarray(r_mod_q, dtype=jnp.uint32),
     }
     return psi_powers, packed
 
@@ -283,37 +331,25 @@ def ntt_candidate1(x, *, q, psi_powers, twiddles):
 
 def ntt_candidate2(x, *, q, psi_powers, twiddles):
     """Forward negacyclic NTT using Montgomery multiplication in butterflies."""
+    del psi_powers
     x = jnp.asarray(x, dtype=jnp.uint32)
     q = jnp.asarray(q, dtype=jnp.uint32)
 
     batch, N = x.shape
     logN = N.bit_length() - 1
 
-    rev, psi_rev, stage_twiddles, raw_twiddles = _unpack_twiddles(twiddles)
-    q_neg_inv = montgomery_neg_inv32_jax(q)
+    rev = twiddles["rev"]
+    psi_rev_mont = twiddles["psi_rev_mont"]
+    twiddle_source = twiddles["stage_twiddles_mont"]
+    q_neg_inv = twiddles["q_neg_inv"]
 
-    if rev is not None and psi_rev is not None:
-        y = mod_mul(x[:, rev], psi_rev, q)
-    else:
-        if rev is None:
-            rev = _bit_reverse_indices(N)
-        y = mod_mul(x, psi_powers, q)
-        y = y[:, rev]
-
-    # Keep the state in Montgomery form throughout the butterfly loop.
-    y = to_montgomery(y, q=q)
+    y = mod_mul(x[:, rev], psi_rev_mont, q)
 
     for stage in range(logN):
         span = 1 << stage
         block = 2 * span
         num_blocks = N // block
-
-        if stage_twiddles is None:
-            tw = jnp.asarray(raw_twiddles[span:block], dtype=jnp.uint32).reshape(1, 1, span)
-        else:
-            tw = jnp.asarray(stage_twiddles[stage], dtype=jnp.uint32)
-
-        tw_mont = to_montgomery(tw, q=q)
+        tw_mont = jnp.asarray(twiddle_source[stage], dtype=jnp.uint32)
 
         y_reshaped = y.reshape(batch, num_blocks, 2, span)
         u = y_reshaped[:, :, 0, :]
