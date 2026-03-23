@@ -36,6 +36,81 @@ def mod_mul(a: jnp.ndarray, b: jnp.ndarray, q: jnp.ndarray) -> jnp.ndarray:
 
 
 @lru_cache(maxsize=None)
+def montgomery_neg_inv32(q: int) -> int:
+    """Return -q^{-1} mod 2^32 for an odd 32-bit modulus q."""
+    if q <= 0 or q >= (1 << 32):
+        raise ValueError(f"q must fit in 32 bits, got {q}")
+    if (q & 1) == 0:
+        raise ValueError(f"q must be odd for Montgomery arithmetic, got {q}")
+    return (-pow(q, -1, 1 << 32)) & 0xFFFFFFFF
+
+
+def montgomery_neg_inv32_jax(q: jnp.ndarray) -> jnp.ndarray:
+    """Return -q^{-1} mod 2^32 using only JAX ops."""
+    q32 = jnp.asarray(q, dtype=jnp.uint32)
+    inv = jnp.asarray(1, dtype=jnp.uint32)
+
+    # Newton iteration over 2-adics: each step doubles the number of
+    # correct low bits of q^{-1} modulo 2^32.
+    for _ in range(5):
+        inv = inv * (jnp.asarray(2, dtype=jnp.uint32) - q32 * inv)
+
+    return jnp.asarray(0, dtype=jnp.uint32) - inv
+
+
+def montgomery_reduce(
+    t: jnp.ndarray,
+    *,
+    q: jnp.ndarray,
+    q_neg_inv: int | jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """Return t * R^{-1} mod q using Montgomery reduction with R = 2^32."""
+    q32 = jnp.asarray(q, dtype=jnp.uint32)
+    q64 = q32.astype(jnp.uint64)
+
+    if q_neg_inv is None:
+        q_neg_inv = montgomery_neg_inv32_jax(q32)
+
+    t64 = jnp.asarray(t, dtype=jnp.uint64)
+    q_neg_inv64 = jnp.asarray(q_neg_inv, dtype=jnp.uint64)
+    mask = jnp.asarray((1 << 32) - 1, dtype=jnp.uint64)
+
+    m = (t64 * q_neg_inv64) & mask
+    u = (t64 + m * q64) >> 32
+    return jnp.where(u >= q64, u - q64, u).astype(jnp.uint32)
+
+
+def montgomery_mul(
+    a: jnp.ndarray,
+    b: jnp.ndarray,
+    *,
+    q: jnp.ndarray,
+    q_neg_inv: int | jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """Return a * b * R^{-1} mod q in the Montgomery domain."""
+    prod = jnp.asarray(a, dtype=jnp.uint64) * jnp.asarray(b, dtype=jnp.uint64)
+    return montgomery_reduce(prod, q=q, q_neg_inv=q_neg_inv)
+
+
+def to_montgomery(a: jnp.ndarray, *, q: jnp.ndarray) -> jnp.ndarray:
+    """Return a * R mod q with R = 2^32."""
+    q64 = jnp.asarray(q, dtype=jnp.uint64)
+    a64 = jnp.asarray(a, dtype=jnp.uint64)
+    r_mod_q = jnp.remainder(jnp.asarray(1 << 32, dtype=jnp.uint64), q64)
+    return jnp.remainder(a64 * r_mod_q, q64).astype(jnp.uint32)
+
+
+def from_montgomery(
+    a: jnp.ndarray,
+    *,
+    q: jnp.ndarray,
+    q_neg_inv: int | jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """Return the standard representation of a Montgomery-domain value."""
+    return montgomery_reduce(a.astype(jnp.uint64), q=q, q_neg_inv=q_neg_inv)
+
+
+@lru_cache(maxsize=None)
 def _bit_reverse_indices(N):
     """Return bit-reversal permutation indices for power-of-two N."""
     logN = N.bit_length() - 1
@@ -77,7 +152,7 @@ def ntt(x, *, q, psi_powers, twiddles):
     Returns:
         jnp.ndarray: NTT output, same shape as input
     """
-    return ntt_candidate1(x, q=q, psi_powers=psi_powers, twiddles=twiddles)
+    return ntt_candidate2(x, q=q, psi_powers=psi_powers, twiddles=twiddles)
 
 def prepare_tables(*, q, psi_powers, twiddles):
     """Optional one-time table preparation."""
@@ -204,3 +279,53 @@ def ntt_candidate1(x, *, q, psi_powers, twiddles):
         y = jnp.concatenate([top[:, :, jnp.newaxis, :], bot[:, :, jnp.newaxis, :]], axis=2).reshape(batch, N)
 
     return y
+
+
+def ntt_candidate2(x, *, q, psi_powers, twiddles):
+    """Forward negacyclic NTT using Montgomery multiplication in butterflies."""
+    x = jnp.asarray(x, dtype=jnp.uint32)
+    q = jnp.asarray(q, dtype=jnp.uint32)
+
+    batch, N = x.shape
+    logN = N.bit_length() - 1
+
+    rev, psi_rev, stage_twiddles, raw_twiddles = _unpack_twiddles(twiddles)
+    q_neg_inv = montgomery_neg_inv32_jax(q)
+
+    if rev is not None and psi_rev is not None:
+        y = mod_mul(x[:, rev], psi_rev, q)
+    else:
+        if rev is None:
+            rev = _bit_reverse_indices(N)
+        y = mod_mul(x, psi_powers, q)
+        y = y[:, rev]
+
+    # Keep the state in Montgomery form throughout the butterfly loop.
+    y = to_montgomery(y, q=q)
+
+    for stage in range(logN):
+        span = 1 << stage
+        block = 2 * span
+        num_blocks = N // block
+
+        if stage_twiddles is None:
+            tw = jnp.asarray(raw_twiddles[span:block], dtype=jnp.uint32).reshape(1, 1, span)
+        else:
+            tw = jnp.asarray(stage_twiddles[stage], dtype=jnp.uint32)
+
+        tw_mont = to_montgomery(tw, q=q)
+
+        y_reshaped = y.reshape(batch, num_blocks, 2, span)
+        u = y_reshaped[:, :, 0, :]
+        v = y_reshaped[:, :, 1, :]
+
+        t = montgomery_mul(v, tw_mont, q=q, q_neg_inv=q_neg_inv)
+        top = mod_add(u, t, q)
+        bot = mod_sub(u, t, q)
+
+        y = jnp.concatenate(
+            [top[:, :, jnp.newaxis, :], bot[:, :, jnp.newaxis, :]],
+            axis=2,
+        ).reshape(batch, N)
+
+    return from_montgomery(y, q=q, q_neg_inv=q_neg_inv)
