@@ -4,6 +4,7 @@ Negacyclic Number Theoretic Transform (NTT) implementation.
 # AGENT ATTENTION!
 # ADITIONAL JIT IS NOT ALLOWED!
 
+import os
 from functools import lru_cache
 
 import jax
@@ -407,17 +408,98 @@ def ntt_candidate3(x, *, q, psi_powers, twiddles):
     return from_montgomery(y, q=q, q_neg_inv=q_neg_inv)
 
 
+def prepare_tables_stockham(*, q, psi_powers, twiddles):
+    """Pack tables for a Stockham auto-sort negacyclic NTT."""
+    del q
+
+    psi_powers = jnp.asarray(psi_powers, dtype=jnp.uint32)
+    twiddles = jnp.asarray(twiddles, dtype=jnp.uint32)
+
+    N = int(psi_powers.shape[0])
+    if N <= 0 or (N & (N - 1)) != 0:
+        raise ValueError(f"N must be a positive power of two, got {N}")
+
+    logN = N.bit_length() - 1
+    stage_twiddles = tuple(
+        twiddles[1 << s: 1 << (s + 1)].reshape(1, 1 << s, 1)
+        for s in range(logN)
+    )
+
+    packed = {
+        "psi_powers": psi_powers,
+        "stage_twiddles": stage_twiddles,
+    }
+    return psi_powers, packed
+
+
+def ntt_candidate_stockham(x, *, q, psi_powers, twiddles):
+    """Forward negacyclic NTT via Stockham auto-sort butterflies."""
+    x = jnp.asarray(x, dtype=jnp.uint32)
+    q = jnp.asarray(q, dtype=jnp.uint32)
+
+    packed_psi = None
+    stage_twiddles = None
+    if isinstance(twiddles, dict):
+        packed_psi = twiddles.get("psi_powers")
+        stage_twiddles = twiddles.get("stage_twiddles")
+
+    if packed_psi is not None:
+        psi_powers = packed_psi
+    else:
+        psi_powers = jnp.asarray(psi_powers, dtype=jnp.uint32)
+
+    batch, N = x.shape
+    logN = N.bit_length() - 1
+    q64 = q.astype(jnp.uint64)
+
+    y = jnp.remainder(
+        x.astype(jnp.uint64) * psi_powers.astype(jnp.uint64),
+        q64,
+    ).astype(jnp.uint32)
+
+    for stage in range(logN):
+        half = 1 << stage
+        r = N >> (stage + 1)
+
+        if stage_twiddles is None:
+            tw = jnp.asarray(
+                twiddles[half: 2 * half], dtype=jnp.uint32
+            ).reshape(1, half, 1)
+        else:
+            tw = stage_twiddles[stage]
+
+        src = y.reshape(batch, half, 2, r)
+        u = src[:, :, 0, :]
+        v = src[:, :, 1, :]
+
+        t = jnp.remainder(
+            v.astype(jnp.uint64) * tw.astype(jnp.uint64),
+            q64,
+        ).astype(jnp.uint32)
+        top = jnp.where(u + t >= q, u + t - q, u + t)
+        bot = jnp.where(u >= t, u - t, u + q - t)
+
+        y = jnp.concatenate([top, bot], axis=1).reshape(batch, N)
+
+    return y
+
+
 # -----------------------------------------------------------------------------
 # Core NTT
 # -----------------------------------------------------------------------------
 SOLUTIONS = {
-    "yf3005_1": (ntt_candidate0, prepare_tables0),
+    "yf3005_1_CooleyTukey": (ntt_candidate0, prepare_tables0),
     "hy3281_1": (ntt_candidate1, prepare_tables1),
-    "qz2866_1_hy3281_1": (ntt_candidate2, prepare_tables1),
-    "qz2866_Montgomery": (ntt_candidate3, prepare_tables3),
+    "qz2866_1": (ntt_candidate2, prepare_tables1),
+    "montgomery": (ntt_candidate3, prepare_tables3),
+    "stockham": (ntt_candidate_stockham, prepare_tables_stockham),
 }
 
-CHOICE = "qz2866_Montgomery"
+DEFAULT_CHOICE = "stockham"
+CHOICE = os.environ.get("CHOICE", DEFAULT_CHOICE)
+if CHOICE not in SOLUTIONS:
+    valid = ", ".join(sorted(SOLUTIONS))
+    raise ValueError(f"Unknown CHOICE={CHOICE!r}. Expected one of: {valid}")
 
 @jax.jit
 def ntt(x, *, q, psi_powers, twiddles):
