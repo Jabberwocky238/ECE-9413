@@ -131,34 +131,15 @@ def _unpack_twiddles(twiddles):
             twiddles.get("raw"),
         )
     return None, None, None, twiddles
-
-
 # -----------------------------------------------------------------------------
-# Core NTT
+# Modular Arithmetic
 # -----------------------------------------------------------------------------
 
-
-@jax.jit
-def ntt(x, *, q, psi_powers, twiddles):
-    """
-    Compute the forward negacyclic NTT.
-
-    Args:
-        x: Input coefficients, shape (batch, N), values in [0, q)
-        q: Prime modulus satisfying (q - 1) % 2N == 0
-        psi_powers: Precomputed psi^n table
-        twiddles: Precomputed twiddle table or packed prepare_tables format
-
-    Returns:
-        jnp.ndarray: NTT output, same shape as input
-    """
-    return ntt_candidate1(x, q=q, psi_powers=psi_powers, twiddles=twiddles)
-
-def prepare_tables(*, q, psi_powers, twiddles):
-    """Optional one-time table preparation."""
-    return prepare_tables0(q=q, psi_powers=psi_powers, twiddles=twiddles)
 
 def prepare_tables0(*, q, psi_powers, twiddles):
+    return psi_powers, twiddles
+
+def prepare_tables1(*, q, psi_powers, twiddles):
     del q
 
     psi_powers = jnp.asarray(psi_powers, dtype=jnp.uint32)
@@ -188,8 +169,8 @@ def prepare_tables0(*, q, psi_powers, twiddles):
     return psi_powers, packed
 
 
-def prepare_tables2(*, q, psi_powers, twiddles):
-    """Prepare standard and Montgomery-domain tables for candidate2-style NTT."""
+def prepare_tables3(*, q, psi_powers, twiddles):
+    """Prepare standard and Montgomery-domain tables for candidate3-style NTT."""
     q32 = jnp.asarray(q, dtype=jnp.uint32)
     psi_powers = jnp.asarray(psi_powers, dtype=jnp.uint32)
     twiddles = jnp.asarray(twiddles, dtype=jnp.uint32)
@@ -232,8 +213,67 @@ def prepare_tables2(*, q, psi_powers, twiddles):
     }
     return psi_powers, packed
 
-# 4.54s, 4.84s, 4.91s, 4.44s
 def ntt_candidate0(x, *, q, psi_powers, twiddles):
+    batch, N = x.shape
+    logN = N.bit_length() - 1
+    
+    # Step 1: Apply negacyclic twist: x'[n] = x[n] * psi^n (mod q)
+    y = mod_mul(x, psi_powers, q)
+    
+    # Step 2: Bit-reversal permutation for DIT
+    def bit_reverse_indices(n, logn):
+        indices = jnp.arange(n)
+        rev = jnp.zeros(n, dtype=jnp.int32)
+        for b in range(logn):
+            rev |= ((indices >> b) & 1) << (logn - 1 - b)
+        return rev
+    
+    rev_indices = bit_reverse_indices(N, logN)
+    y = y[:, rev_indices]
+    
+    # Step 3: Cooley-Tukey DIT butterfly stages
+    # Process from small spans to large spans
+    for stage in range(logN):
+        span = 1 << stage  # Butterfly span: 1, 2, 4, ..., N/2
+        
+        # Get twiddle factors for this stage
+        stage_twiddles = twiddles[span:2*span]
+        
+        # Reshape for vectorized operations
+        # Each block has size 2*span and contains span butterfly pairs
+        num_blocks = N // (2 * span)
+        
+        # Reshape into (batch, num_blocks, 2, span)
+        # where dimension 2 separates the two halves of each block
+        y_reshaped = y.reshape(batch, num_blocks, 2, span)
+        
+        # u and v are the two butterfly inputs
+        u = y_reshaped[:, :, 0, :]  # Shape: (batch, num_blocks, span)
+        v = y_reshaped[:, :, 1, :]  # Shape: (batch, num_blocks, span)
+        
+        # Broadcast twiddles to (1, 1, span) for broadcasting
+        tw = stage_twiddles.reshape(1, 1, span)
+        
+        # DIT butterfly:
+        # temp = twiddle * v
+        # output_first = u + temp
+        # output_second = u - temp
+        temp = mod_mul(v, tw, q)
+        y_reshaped = y_reshaped.at[:, :, 0, :].set(mod_add(u, temp, q))
+        y_reshaped = y_reshaped.at[:, :, 1, :].set(mod_sub(u, temp, q))
+        
+        # Reshape back
+        y = y_reshaped.reshape(batch, N)
+    
+    # Ensure final result is in [0, q) by doing one final reduction
+    # This shouldn't be necessary if mod_add/mod_sub work correctly,
+    # but let's be safe
+    y = y % jnp.uint32(q)
+    
+    return y
+
+# 4.54s, 4.84s, 4.91s, 4.44s
+def ntt_candidate1(x, *, q, psi_powers, twiddles):
     x = jnp.asarray(x, dtype=jnp.uint32)
     psi_powers = jnp.asarray(psi_powers, dtype=jnp.uint32)
 
@@ -279,7 +319,7 @@ def ntt_candidate0(x, *, q, psi_powers, twiddles):
     return y
 
 # 4.34s, 4.41s, 4.39s, 4.26s
-def ntt_candidate1(x, *, q, psi_powers, twiddles):
+def ntt_candidate2(x, *, q, psi_powers, twiddles):
     x = jnp.asarray(x, dtype=jnp.uint32)
     q = jnp.asarray(q, dtype=jnp.uint32)
     q64 = q.astype(jnp.uint64) # 提前转 u64 减少循环内转换
@@ -329,7 +369,7 @@ def ntt_candidate1(x, *, q, psi_powers, twiddles):
     return y
 
 
-def ntt_candidate2(x, *, q, psi_powers, twiddles):
+def ntt_candidate3(x, *, q, psi_powers, twiddles):
     """Forward negacyclic NTT using Montgomery multiplication in butterflies."""
     del psi_powers
     x = jnp.asarray(x, dtype=jnp.uint32)
@@ -365,3 +405,36 @@ def ntt_candidate2(x, *, q, psi_powers, twiddles):
         ).reshape(batch, N)
 
     return from_montgomery(y, q=q, q_neg_inv=q_neg_inv)
+
+
+# -----------------------------------------------------------------------------
+# Core NTT
+# -----------------------------------------------------------------------------
+SOLUTIONS = {
+    "yf3005_1": (ntt_candidate0, prepare_tables0),
+    "hy3281_1": (ntt_candidate1, prepare_tables1),
+    "qz2866_1_hy3281_1": (ntt_candidate2, prepare_tables1),
+    "qz2866_Montgomery": (ntt_candidate3, prepare_tables3),
+}
+
+CHOICE = "qz2866_Montgomery"
+
+@jax.jit
+def ntt(x, *, q, psi_powers, twiddles):
+    """
+    Compute the forward negacyclic NTT.
+
+    Args:
+        x: Input coefficients, shape (batch, N), values in [0, q)
+        q: Prime modulus satisfying (q - 1) % 2N == 0
+        psi_powers: Precomputed psi^n table
+        twiddles: Precomputed twiddle table or packed prepare_tables format
+
+    Returns:
+        jnp.ndarray: NTT output, same shape as input
+    """
+    return SOLUTIONS[CHOICE][0](x, q=q, psi_powers=psi_powers, twiddles=twiddles)
+
+def prepare_tables(*, q, psi_powers, twiddles):
+    """Optional one-time table preparation."""
+    return SOLUTIONS[CHOICE][1](q=q, psi_powers=psi_powers, twiddles=twiddles)
